@@ -1,14 +1,18 @@
 /***************************************************
- * ray_voxel.cpp
+ * ray_voxel.cpp - 基于多视角图像的运动体素重建
  *
- * A "complete" C++ example:
- *   1) Parse metadata.json with nlohmann::json
- *   2) Load images (stb_image) in grayscale
- *   3) Do motion detection between consecutive frames
- *      for each camera
- *   4) Cast rays (voxel DDA) for changed pixels
- *   5) Accumulate in a shared 3D voxel grid
- *   6) Save the voxel grid to a .bin file
+ * 完整C++实现流程:
+ *   1) 使用nlohmann::json解析metadata.json
+ *   2) 加载灰度图像(stb_image)
+ *   3) 对每个相机的连续帧进行运动检测
+ *   4) 为变化像素投射光线(体素DDA算法)
+ *   5) 在共享3D体素网格中累积
+ *   6) 将体素网格保存为.bin文件
+ *
+ * 核心算法:
+ * - 数字微分分析器(DDA)用于高效光线遍历
+ * - 基于帧间差异的运动检测
+ * - 多相机数据融合
  ***************************************************/
 
 
@@ -36,100 +40,107 @@ using json = nlohmann::json;
 //----------------------------------------------
 // 1) Data Structures
 //----------------------------------------------
+// 3D向量结构
 struct Vec3 {
-    float x, y, z;
+    float x, y, z;  // 三维坐标
 };
 
+// 3x3矩阵结构
 struct Mat3 {
-    float m[9];
+    float m[9];  // 按行优先存储的矩阵元素
 };
 
+// 帧信息结构体
 struct FrameInfo {
-    int camera_index;
-    int frame_index;
-    Vec3 camera_position;
-    float yaw, pitch, roll;
-    float fov_degrees;
-    std::string image_file;
-    // Optionally we store object_name, object_location if needed
+    int camera_index;     // 相机索引
+    int frame_index;      // 帧序号
+    Vec3 camera_position; // 相机位置(x,y,z)
+    float yaw, pitch, roll; // 欧拉角(偏航、俯仰、滚转)
+    float fov_degrees;    // 视场角(度)
+    std::string image_file; // 图像文件名
+    // 可选存储对象名称和位置(如果需要)
 };
 
 //----------------------------------------------
 // 2) Basic Math Helpers
 //----------------------------------------------
+// 角度转弧度
 static inline float deg2rad(float deg) {
     return deg * 3.14159265358979323846f / 180.0f;
 }
 
+// 向量归一化
 static inline Vec3 normalize(const Vec3 &v) {
     float len = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
     if(len < 1e-12f) {
-        return {0.f, 0.f, 0.f};
+        return {0.f, 0.f, 0.f};  // 零向量处理
     }
-    return { v.x/len, v.y/len, v.z/len };
+    return { v.x/len, v.y/len, v.z/len };  // 归一化向量
 }
 
-// Multiply 3x3 matrix by Vec3
+// 3x3矩阵乘以3D向量
 static inline Vec3 mat3_mul_vec3(const Mat3 &M, const Vec3 &v) {
     Vec3 r;
-    r.x = M.m[0]*v.x + M.m[1]*v.y + M.m[2]*v.z;
-    r.y = M.m[3]*v.x + M.m[4]*v.y + M.m[5]*v.z;
-    r.z = M.m[6]*v.x + M.m[7]*v.y + M.m[8]*v.z;
+    r.x = M.m[0]*v.x + M.m[1]*v.y + M.m[2]*v.z;  // 第一行点积
+    r.y = M.m[3]*v.x + M.m[4]*v.y + M.m[5]*v.z;  // 第二行点积
+    r.z = M.m[6]*v.x + M.m[7]*v.y + M.m[8]*v.z;  // 第三行点积
     return r;
 }
 
 //----------------------------------------------
 // 3) Euler -> Rotation Matrix
 //----------------------------------------------
+// 根据欧拉角(yaw/pitch/roll)构建旋转矩阵
 Mat3 rotation_matrix_yaw_pitch_roll(float yaw_deg, float pitch_deg, float roll_deg) {
-    float y = deg2rad(yaw_deg);
-    float p = deg2rad(pitch_deg);
-    float r = deg2rad(roll_deg);
+    float y = deg2rad(yaw_deg);    // 偏航角(绕Z轴)
+    float p = deg2rad(pitch_deg);  // 俯仰角(绕Y轴)
+    float r = deg2rad(roll_deg);   // 滚转角(绕X轴)
 
-    // Build each sub-rotation
-    // Rz(yaw)
+    // 构建各轴旋转矩阵
+    // Rz(yaw) - 绕Z轴旋转
     float cy = std::cos(y), sy = std::sin(y);
     float Rz[9] = {
-        cy, -sy, 0.f,
-        sy,  cy, 0.f,
-        0.f, 0.f, 1.f
+        cy, -sy, 0.f,  // 第一行
+        sy,  cy, 0.f,  // 第二行
+        0.f, 0.f, 1.f  // 第三行
     };
 
-    // Ry(roll)
+    // Ry(roll) - 绕Y轴旋转
     float cr = std::cos(r), sr = std::sin(r);
     float Ry[9] = {
-        cr,  0.f, sr,
-        0.f, 1.f, 0.f,
-        -sr, 0.f, cr
+        cr,  0.f, sr,   // 第一行
+        0.f, 1.f, 0.f,  // 第二行
+        -sr, 0.f, cr    // 第三行
     };
 
-    // Rx(pitch)
+    // Rx(pitch) - 绕X轴旋转
     float cp = std::cos(p), sp = std::sin(p);
     float Rx[9] = {
-        1.f,  0.f,  0.f,
-        0.f,  cp,  -sp,
-        0.f,  sp,   cp
+        1.f,  0.f,  0.f,  // 第一行
+        0.f,  cp,  -sp,   // 第二行
+        0.f,  sp,   cp    // 第三行
     };
 
-    // Helper to multiply 3x3
+    // 3x3矩阵乘法辅助函数
     auto matmul3x3 = [&](const float A[9], const float B[9], float C[9]){
         for(int row=0; row<3; ++row) {
             for(int col=0; col<3; ++col) {
                 C[row*3+col] =
-                    A[row*3+0]*B[0*3+col] +
+                    A[row*3+0]*B[0*3+col] +  // 行*列
                     A[row*3+1]*B[1*3+col] +
                     A[row*3+2]*B[2*3+col];
             }
         }
     };
 
+    // 组合旋转矩阵: R = Rz * Ry * Rx
     float Rtemp[9], Rfinal[9];
-    matmul3x3(Rz, Ry, Rtemp);    // Rz * Ry
-    matmul3x3(Rtemp, Rx, Rfinal); // (Rz*Ry)*Rx
+    matmul3x3(Rz, Ry, Rtemp);     // 先计算Rz*Ry
+    matmul3x3(Rtemp, Rx, Rfinal); // 再乘以Rx
 
     Mat3 out;
     for(int i=0; i<9; i++){
-        out.m[i] = Rfinal[i];
+        out.m[i] = Rfinal[i];  // 复制结果
     }
     return out;
 }
@@ -257,30 +268,34 @@ MotionMask detect_motion(const ImageGray &prev, const ImageGray &next, float thr
 //----------------------------------------------
 // 6) Voxel DDA
 //----------------------------------------------
+// 光线步进信息
 struct RayStep {
-    int ix, iy, iz;
-    int step_count;
-    float distance;
+    int ix, iy, iz;      // 当前体素索引
+    int step_count;       // 步进计数
+    float distance;       // 当前距离
 };
 
+// 安全除法(避免除以零)
 static inline float safe_div(float num, float den) {
     float eps = 1e-12f;
     if(std::fabs(den) < eps) {
-        return std::numeric_limits<float>::infinity();
+        return std::numeric_limits<float>::infinity();  // 返回无穷大
     }
     return num / den;
 }
 
+// 使用DDA算法将光线投射到体素网格中
 std::vector<RayStep> cast_ray_into_grid(
-    const Vec3 &camera_pos, 
-    const Vec3 &dir_normalized, 
-    int N, 
-    float voxel_size, 
-    const Vec3 &grid_center)
+    const Vec3 &camera_pos,     // 相机位置
+    const Vec3 &dir_normalized, // 归一化光线方向
+    int N,                      // 网格分辨率(NxNxN)
+    float voxel_size,           // 体素大小(单位:米)
+    const Vec3 &grid_center)    // 网格中心位置
 {
     std::vector<RayStep> steps;
-    steps.reserve(64);
+    steps.reserve(64);  // 预分配空间
 
+    // 计算网格边界
     float half_size = 0.5f * (N * voxel_size);
     Vec3 grid_min = { grid_center.x - half_size,
                       grid_center.y - half_size,
@@ -289,105 +304,111 @@ std::vector<RayStep> cast_ray_into_grid(
                       grid_center.y + half_size,
                       grid_center.z + half_size };
 
-    float t_min = 0.f;
-    float t_max = std::numeric_limits<float>::infinity();
+    float t_min = 0.f;  // 进入距离
+    float t_max = std::numeric_limits<float>::infinity();  // 退出距离
 
-    // 1) Ray-box intersection
+    // 1) 光线与包围盒相交检测
     for(int i=0; i<3; i++){
         float origin = (i==0)? camera_pos.x : ((i==1)? camera_pos.y : camera_pos.z);
         float d      = (i==0)? dir_normalized.x : ((i==1)? dir_normalized.y : dir_normalized.z);
         float mn     = (i==0)? grid_min.x : ((i==1)? grid_min.y : grid_min.z);
         float mx     = (i==0)? grid_max.x : ((i==1)? grid_max.y : grid_max.z);
 
-        if(std::fabs(d) < 1e-12f){
+        if(std::fabs(d) < 1e-12f){  // 光线平行于轴
             if(origin < mn || origin > mx){
-                return steps; // no intersection
+                return steps; // 不相交
             }
         } else {
-            float t1 = (mn - origin)/d;
-            float t2 = (mx - origin)/d;
+            float t1 = (mn - origin)/d;  // 与最小平面相交
+            float t2 = (mx - origin)/d;  // 与最大平面相交
             float t_near = std::fmin(t1, t2);
             float t_far  = std::fmax(t1, t2);
-            if(t_near > t_min) t_min = t_near;
-            if(t_far  < t_max) t_max = t_far;
-            if(t_min > t_max){
+            if(t_near > t_min) t_min = t_near;  // 更新最近交点
+            if(t_far  < t_max) t_max = t_far;   // 更新最远交点
+            if(t_min > t_max){  // 无有效交点
                 return steps;
             }
         }
     }
 
-    if(t_min < 0.f) t_min = 0.f;
+    if(t_min < 0.f) t_min = 0.f;  // 确保在光线前方
 
-    // 2) Start voxel
+    // 2) 计算起始体素
     Vec3 start_world = { camera_pos.x + t_min*dir_normalized.x,
                          camera_pos.y + t_min*dir_normalized.y,
                          camera_pos.z + t_min*dir_normalized.z };
+    // 转换为网格坐标
     float fx = (start_world.x - grid_min.x)/voxel_size;
     float fy = (start_world.y - grid_min.y)/voxel_size;
     float fz = (start_world.z - grid_min.z)/voxel_size;
 
-    int ix = int(fx);
-    int iy = int(fy);
-    int iz = int(fz);
+    int ix = int(fx);  // x索引
+    int iy = int(fy);  // y索引
+    int iz = int(fz);  // z索引
     if(ix<0 || ix>=N || iy<0 || iy>=N || iz<0 || iz>=N) {
-        return steps;
+        return steps;  // 起始点在网格外
     }
 
-    // 3) Step direction
-    int step_x = (dir_normalized.x >= 0.f)? 1 : -1;
-    int step_y = (dir_normalized.y >= 0.f)? 1 : -1;
-    int step_z = (dir_normalized.z >= 0.f)? 1 : -1;
+    // 3) 确定步进方向
+    int step_x = (dir_normalized.x >= 0.f)? 1 : -1;  // x步进方向
+    int step_y = (dir_normalized.y >= 0.f)? 1 : -1;  // y步进方向
+    int step_z = (dir_normalized.z >= 0.f)? 1 : -1;  // z步进方向
 
+    // 边界计算辅助函数
     auto boundary_in_world_x = [&](int i_x){ return grid_min.x + i_x*voxel_size; };
     auto boundary_in_world_y = [&](int i_y){ return grid_min.y + i_y*voxel_size; };
     auto boundary_in_world_z = [&](int i_z){ return grid_min.z + i_z*voxel_size; };
 
+    // 计算下一个边界
     int nx_x = ix + (step_x>0?1:0);
     int nx_y = iy + (step_y>0?1:0);
     int nx_z = iz + (step_z>0?1:0);
 
-    float next_bx = boundary_in_world_x(nx_x);
-    float next_by = boundary_in_world_y(nx_y);
-    float next_bz = boundary_in_world_z(nx_z);
+    float next_bx = boundary_in_world_x(nx_x);  // 下一个x边界
+    float next_by = boundary_in_world_y(nx_y);  // 下一个y边界
+    float next_bz = boundary_in_world_z(nx_z);  // 下一个z边界
 
+    // 计算到各轴边界的距离
     float t_max_x = safe_div(next_bx - camera_pos.x, dir_normalized.x);
     float t_max_y = safe_div(next_by - camera_pos.y, dir_normalized.y);
     float t_max_z = safe_div(next_bz - camera_pos.z, dir_normalized.z);
 
+    // 计算步长增量
     float t_delta_x = safe_div(voxel_size, std::fabs(dir_normalized.x));
     float t_delta_y = safe_div(voxel_size, std::fabs(dir_normalized.y));
     float t_delta_z = safe_div(voxel_size, std::fabs(dir_normalized.z));
 
-    float t_current = t_min;
-    int step_count = 0;
+    float t_current = t_min;  // 当前距离
+    int step_count = 0;       // 步进计数器
 
-    // 4) Walk
+    // 4) DDA步进循环
     while(t_current <= t_max){
         RayStep rs;
-        rs.ix = ix; 
-        rs.iy = iy; 
-        rs.iz = iz;
+        rs.ix = ix;  // 当前x索引
+        rs.iy = iy;  // 当前y索引
+        rs.iz = iz;  // 当前z索引
         rs.step_count = step_count;
         rs.distance = t_current;
 
-        steps.push_back(rs);
+        steps.push_back(rs);  // 记录步进信息
 
+        // 选择下一个最近的边界
         if(t_max_x < t_max_y && t_max_x < t_max_z){
-            ix += step_x;
+            ix += step_x;  // x方向步进
             t_current = t_max_x;
             t_max_x += t_delta_x;
         } else if(t_max_y < t_max_z){
-            iy += step_y;
+            iy += step_y;  // y方向步进
             t_current = t_max_y;
             t_max_y += t_delta_y;
         } else {
-            iz += step_z;
+            iz += step_z;  // z方向步进
             t_current = t_max_z;
             t_max_z += t_delta_z;
         }
         step_count++;
         if(ix<0 || ix>=N || iy<0 || iy>=N || iz<0 || iz>=N){
-            break;
+            break;  // 超出网格边界
         }
     }
 

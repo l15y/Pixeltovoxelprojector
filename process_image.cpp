@@ -1,13 +1,14 @@
-// process_image.cpp
+// process_image.cpp - 光线投射和体素网格处理核心算法(C++实现)
+// 该文件实现了从天文图像到3D体素网格的光线投射算法
 
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
-#include <pybind11/stl.h>
-#include <cmath>
-#include <vector>
-#include <array>
-#include <algorithm>
-#include <limits>
+#include <pybind11/pybind11.h>  // Python-C++绑定库
+#include <pybind11/numpy.h>    // NumPy数组支持
+#include <pybind11/stl.h>      // STL容器支持
+#include <cmath>               // 数学函数
+#include <vector>              // 向量容器
+#include <array>               // 固定大小数组
+#include <algorithm>           // 算法函数
+#include <limits>              // 数值极限
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -16,10 +17,15 @@
 namespace py = pybind11;
 
 /**
- * Compute the intersection of a ray with an axis-aligned bounding box (AABB).
+ * 计算光线与轴对齐包围盒(AABB)的交点
  *
- * This function determines where a ray enters and exits the AABB defined by box_min and box_max.
- * If the ray does not intersect the box, it returns false.
+ * 该函数确定光线与由box_min和box_max定义的AABB的进入和退出点
+ * 如果光线不与盒子相交，则返回false
+ *
+ * 算法原理:
+ * 1. 对每个坐标轴(x,y,z)分别计算光线与两个平行平面的交点参数t1和t2
+ * 2. 取所有轴的交点参数的并集作为最终的交点区间
+ * 3. 如果区间有效则返回交点参数，否则返回不相交
  */
 bool ray_aabb_intersection(
     const std::array<double, 3>& ray_origin,
@@ -61,9 +67,19 @@ bool ray_aabb_intersection(
 }
 
 /**
- * Convert a 3D point to voxel indices within the voxel grid.
+ * 将3D点转换为体素网格内的索引
  *
- * Given a point in space and the voxel grid extents, compute which voxel it falls into.
+ * 给定空间中的点和体素网格范围，计算它落在哪个体素中
+ *
+ * 计算步骤:
+ * 1. 检查点是否在体素网格范围内
+ * 2. 计算点在网格内的归一化坐标(0到1之间)
+ * 3. 将归一化坐标转换为体素索引
+ * 4. 对索引进行边界裁剪确保有效性
+ *
+ * 返回:
+ * - 如果点在网格内: 返回(x,y,z)体素索引
+ * - 如果点在网格外: 返回(-1,-1,-1)
  */
 std::tuple<pybind11::ssize_t, pybind11::ssize_t, pybind11::ssize_t> point_to_voxel_indices(
     const std::array<double, 3>& point,
@@ -113,14 +129,29 @@ std::tuple<pybind11::ssize_t, pybind11::ssize_t, pybind11::ssize_t> point_to_vox
 }
 
 /**
- * Process an image and update the voxel grid and celestial sphere texture.
+ * 处理图像并更新体素网格和天球纹理
  *
- * This function:
- * 1. Computes the direction of each pixel in the image.
- * 2. Maps that direction to RA/Dec to find the corresponding brightness on the celestial sphere.
- * 3. Optionally subtracts the background (celestial sphere brightness) from the image brightness.
- * 4. If updating the celestial sphere, accumulates brightness values into the celestial_sphere_texture.
- * 5. If a voxel grid is provided, casts rays into the grid and updates voxel brightness accordingly.
+ * 这是核心处理函数，执行以下操作:
+ * 1. 计算图像中每个像素的方向向量
+ * 2. 将该方向映射到赤经/赤纬(RA/Dec)坐标，找到对应的天球亮度
+ * 3. 可选地从图像亮度中减去背景(天球亮度)
+ * 4. 如果需要更新天球，则将亮度值累积到celestial_sphere_texture中
+ * 5. 如果提供了体素网格，则向网格投射光线并相应更新体素亮度
+ *
+ * 算法流程:
+ * 1. 初始化相机坐标系(基于指向方向)
+ * 2. 对每个像素:
+ *    a. 计算像素方向在世界坐标系中的向量
+ *    b. 转换为RA/Dec坐标
+ *    c. 映射到天球纹理坐标
+ *    d. 执行背景减除(可选)
+ *    e. 更新天球纹理(可选)
+ *    f. 向体素网格投射光线(如果启用)
+ * 3. 使用OpenMP并行加速像素处理
+ *
+ * 注意:
+ * - 该函数会原地修改voxel_grid和celestial_sphere_texture
+ * - 使用原子操作保证多线程安全
  */
 void process_image_cpp(
     py::array_t<double> image,
@@ -365,10 +396,10 @@ void process_image_cpp(
     }
 }
 
-// Expose the function to Python
+// 将函数暴露给Python
 PYBIND11_MODULE(process_image_cpp, m) {
-    m.doc() = "C++ implementation of the process_image function";
-    m.def("process_image_cpp", &process_image_cpp, "Process image and update voxel grid in C++",
+    m.doc() = "process_image函数的C++实现";
+    m.def("process_image_cpp", &process_image_cpp, "用C++处理图像并更新体素网格",
           py::arg("image"),
           py::arg("earth_position"),
           py::arg("pointing_direction"),
